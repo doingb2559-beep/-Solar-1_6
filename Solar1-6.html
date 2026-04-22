@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Solar 1-6 Document Validator</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4.1.2/dist/tesseract.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        #dropzone { border: 2px dashed #ccc; padding: 20px; text-align: center; cursor: pointer; }
+        #dropzone.dragover { border-color: #000; }
+        .card { border: 1px solid #ddd; padding: 10px; margin: 10px 0; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        .pass { color: green; }
+        .fail { color: red; }
+        .warn { color: orange; }
+        #loading { display: none; color: blue; }
+    </style>
+</head>
+<body>
+    <h1>Document Validator</h1>
+    <div id="dropzone">ลากไฟล์มาที่นี่ หรือคลิกเพื่อเลือกไฟล์</div>
+    <p id="file-count">ยังไม่มีไฟล์</p>
+    <button id="btn-validate" onclick="validate()">ตรวจสอบ</button>
+    <button onclick="resetApp()">รีเซ็ต</button>
+    <div id="loading">กำลังประมวลผล...</div>
+    <div id="result"></div>
+
+    <script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+
+let files = [];
+
+// ================= UI =================
+const dropzone = document.getElementById("dropzone");
+
+dropzone.addEventListener("drop", e => {
+  e.preventDefault();
+  files = [...files, ...e.dataTransfer.files];
+  updateFile();
+});
+
+dropzone.addEventListener("dragover", e => e.preventDefault());
+
+dropzone.addEventListener("click", () => {
+  let input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  input.onchange = () => {
+    files = [...files, ...input.files];
+    updateFile();
+  };
+  input.click();
+});
+
+function updateFile() {
+  document.getElementById("file-count").innerText =
+    files.length ? "ไฟล์: " + files.map(f => f.name).join(", ") : "ยังไม่มีไฟล์";
+}
+
+// ================= PDF =================
+async function convertPdf(file) {
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument(buf).promise;
+  const page = await pdf.getPage(1);
+
+  const viewport = page.getViewport({ scale: 2 });
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return canvas.toDataURL();
+}
+
+// ================= EXTRACT =================
+function extractID(text) {
+  let m = text.match(/\d{13}/);
+  return m ? m[0] : null;
+}
+
+function extractName(text) {
+  let m = text.match(/(นาย|นาง|น\.ส\.|นางสาว)\s?[ก-๙]{2,}\s+[ก-๙]{2,}/);
+  return m ? m[0].trim() : null;
+}
+
+// ================= TYPE DETECT =================
+function detectType(text, filename) {
+  let t = text.replace(/\s/g, "");
+
+  if (filename.includes("มอบ") || t.includes("มอบอำนาจ")) return "POA";
+  if (t.includes("บริษัท") || t.includes("หนังสือรับรอง")) return "COMPANY";
+  if (t.includes("แผนผัง") || t.includes("แผนที่")) return "MAP";
+
+  if (t.includes("บัตรประชาชน")) {
+    if (t.includes("ผู้รับ") || filename.includes("รับ")) return "ID_RECEIVER";
+    return "ID_OWNER";
+  }
+
+  if (filename.match(/\.(jpg|jpeg|png)/i)) return "PHOTO";
+
+  return "OTHER";
+}
+
+// ================= MAIN =================
+async function validate() {
+  if (files.length === 0) {
+    alert("กรุณาเลือกไฟล์");
+    return;
+  }
+
+  document.getElementById("btn-validate").disabled = true;
+  document.getElementById("loading").style.display = "block";
+
+  let docs = [];
+
+  try {
+    for (let f of files) {
+      let img = f.type === "application/pdf"
+        ? await convertPdf(f)
+        : f;
+
+      let { data: { text } } = await Tesseract.recognize(img, 'tha+eng');
+
+      docs.push({
+        file: f.name,
+        text,
+        type: detectType(text, f.name),
+        id: extractID(text),
+        name: extractName(text),
+        hasCopy: text.includes("สำเนาถูกต้อง"),
+        hasStamp: text.includes("30") || text.includes("สามสิบ"),
+        witness: (text.match(/พยาน|ลงชื่อ/g) || []).length
+      });
+    }
+
+    processRules(docs);
+
+  } catch (e) {
+    console.error(e);
+    alert("เกิด error: " + e.message);
+  }
+
+  document.getElementById("btn-validate").disabled = false;
+  document.getElementById("loading").style.display = "none";
+}
+
+// ================= RULE =================
+function processRules(docs) {
+
+  let results = [];
+  let missing = [];
+
+  let idOwner = docs.find(d => d.type === "ID_OWNER");
+  let poa = docs.find(d => d.type === "POA");
+
+  let poaNames = poa ? (poa.text.match(/นาย|นาง|นางสาว\s?[ก-๙]+\s+[ก-๙]+/g) || []) : [];
+
+  let receiverDoc = docs.find(d =>
+    d.type === "ID_RECEIVER" ||
+    (poaNames.length && poaNames.some(n => d.text.includes(n)))
+  );
+
+  let ownerName = idOwner?.name || "ไม่ชัดเจน";
+  let receiverName = receiverDoc?.name || poaNames[1] || "ไม่มี";
+
+  // ===== REQUIRED =====
+  let required = ["ID_OWNER", "MAP", "PHOTO"];
+  if (poa) required.push("ID_RECEIVER");
+
+  required.forEach(r => {
+    if (!docs.find(d => d.type === r)) missing.push(r);
+  });
+
+  // ===== 1 =====
+  if (!idOwner)
+    results.push(fail("1. บัตรเจ้าของ", "ไม่พบไฟล์หรือไม่ชัดเจน"));
+  else if (!idOwner.id)
+    results.push(fail("1. บัตรเจ้าของ", "อ่านเลขบัตรไม่ได้"));
+  else
+    results.push(pass("1. บัตรเจ้าของ"));
+
+  // ===== 2 =====
+  let comp = docs.find(d => d.type === "COMPANY");
+  results.push(comp
+    ? pass("2. นิติบุคคล")
+    : { item: "2. นิติบุคคล", status: "⚠️", reason: "ถ้าเป็นบุคคลไม่ต้องใช้" });
+
+  // ===== 3 =====
+  if (poa) {
+    if (poa.witness < 1)
+      results.push(fail("3. มอบอำนาจ", "เอกสารมี แต่ OCR อ่านพยานไม่ชัด"));
+    else if (!poa.hasStamp)
+      results.push(fail("3. มอบอำนาจ", "ไม่พบอากร 30 บาท"));
+    else
+      results.push(pass("3. มอบอำนาจ"));
+  } else {
+    results.push({ item: "3. มอบอำนาจ", status: "⚠️", reason: "ไม่ได้มอบ" });
+  }
+
+  // ===== 4 =====
+  if (!poa) {
+    results.push({ item: "4. บัตรผู้รับมอบ", status: "⚠️", reason: "ไม่ต้องใช้" });
+  } else {
+    if (!receiverDoc)
+      results.push(fail("4. บัตรผู้รับมอบ", "ไม่พบหรือชื่อไม่ตรง POA"));
+    else
+      results.push(pass("4. บัตรผู้รับมอบ"));
+  }
+
+  // ===== 5 =====
+  results.push(docs.find(d => d.type === "MAP")
+    ? pass("5. แผนผัง")
+    : fail("5. แผนผัง", "ไม่พบ"));
+
+  // ===== 6 =====
+  results.push(docs.find(d => d.type === "PHOTO")
+    ? pass("6. รูปถ่าย")
+    : fail("6. รูปถ่าย", "ไม่พบ"));
+
+  render(results, missing, ownerName, receiverName);
+}
+
+// ================= UI =================
+function pass(i) { return { item: i, status: "✅ PASS", reason: "ถูกต้อง" }; }
+function fail(i, r) { return { item: i, status: "❌ FAIL", reason: r }; }
+
+function render(results, missing, owner, receiver) {
+
+  let html = `<div class="card">
+  👤 ผู้ขอใช้บริการ: ${owner}<br>
+  👥 ผู้รับมอบ: ${receiver}
+  </div>`;
+
+  html += `<div class="card"><table>
+  <tr><th>รายการ</th><th>สถานะ</th><th>เหตุผล</th></tr>`;
+
+  results.forEach(r => {
+    let cls = r.status.includes("PASS") ? "pass" :
+              r.status.includes("FAIL") ? "fail" : "warn";
+
+    html += `<tr>
+      <td>${r.item}</td>
+      <td class="${cls}">${r.status}</td>
+      <td>${r.reason}</td>
+    </tr>`;
+  });
+
+  html += `</table></div>`;
+
+  html += `<div class="card">
+  ${missing.length ? "❌ เอกสารไม่ครบ: " + missing.join(", ") : "✅ เอกสารครบ"}
+  </div>`;
+
+  document.getElementById("result").innerHTML = html;
+}
+
+// ================= RESET =================
+function resetApp() {
+  files = [];
+  document.getElementById("result").innerHTML = "";
+  document.getElementById("file-count").innerText = "ยังไม่มีไฟล์";
+}
+</script>
+</body>
+</html>
